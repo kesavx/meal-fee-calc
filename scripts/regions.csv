@@ -1,0 +1,3 @@
+region,breakfast_amt,lunch_amt,dinner_amt,default_shift_start,default_shift_end,early_arrival_cutoff,note
+扬州,2,5,5,08:30,17:15,07:30,早餐2元
+广东,3,5,5,08:30,17:15,07:30,早餐3元；中班晚餐工作餐免费
