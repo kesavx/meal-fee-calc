@@ -1,0 +1,148 @@
+{
+  "_说明": "差异归因规则表。compare_meal_fee.py 读取本文件的 patterns，用特征字段精确匹配。feature 里每个键都必须与脚本提取的特征完全相等，值可为列表表示属于其中之一。correct 表示按现行规则的正确答案，脚本据此判定哪一方与规则不符。新增模式必须同时出现在 references/差异归因规则.md 的同编号说明里。",
+  "patterns": [
+    {
+      "code": "D8",
+      "type": "餐别归属分歧",
+      "name": "加班额度在午餐/晚餐之间分配不同（双方各抵一餐，只是落点不同）",
+      "feature": {
+        "meal": ["午餐", "晚餐"],
+        "is_weekend": true,
+        "ot_covers_meal": true,
+        "same_deduct_count": true,
+        "a_deduct_cnt": 1
+      },
+      "correct": null,
+      "basis": "规则 5.5：可抵餐次有限时，双方各自把额度落在不同餐别。单笔看是差异，能否成立要看该人当天总额是否一致",
+      "action": "按该人净额判断：净额为 0 说明只是分配不同、总额无差；净额不为 0 需返回规则判定应抵哪一餐"
+    },
+    {
+      "code": "D10",
+      "type": "超额抵扣",
+      "name": "一天抵扣的餐数超过加班时长对应额度",
+      "feature": {
+        "is_weekend": true,
+        "ot_mins_180_300": true,
+        "max_deduct_more_than_one_today": true
+      },
+      "correct": null,
+      "basis": "规则 5.2：周末 3-5 小时（含 5 小时整）只抵 1 餐，一天抵 2 餐即超额；具体哪一餐该自付取决于双方抵的餐别是否相同",
+      "action": "调出该人当天全部餐别，按 n_meal 上限保留优先级最高的那一餐，其余应自付"
+    },
+    {
+      "code": "D9",
+      "type": "疑似少算",
+      "name": "加班已覆盖该餐别、本方判抵，但对方该笔无逐笔判定",
+      "feature": {
+        "meal": ["午餐", "晚餐"],
+        "clue_is_candidate": true,
+        "a_deduct": true,
+        "ot_covers_meal": true
+      },
+      "correct": "应抵",
+      "basis": "加班时段覆盖该餐别、时长满足抵餐条件，按规则应由公司承担；对方未提供该笔逐笔判定，无法确认其判法",
+      "action": "请对方补充该笔逐笔判定；确认后按规则应抵"
+    },
+    {
+      "code": "D1",
+      "type": "口径分歧",
+      "name": "加班补助是否需加班单标注餐次",
+      "feature": {
+        "meal": ["午餐", "晚餐"],
+        "ot_mins_ge_60": true,
+        "ot_covers_meal": true,
+        "a_deduct": true,
+        "b_deduct": false
+      },
+      "correct": "应抵",
+      "basis": "规则 5.3：工作日加班≥1h 且加班时段覆盖该餐别即可抵；2026-09 起已取消员工申报「开餐餐费」列，改为按加班时间自动判定，不要求加班单标注补助餐次",
+      "action": "以现行规则为准；请对方停用「加班单须标注补助餐次」的旧口径"
+    },
+    {
+      "code": "D2",
+      "type": "计算错误",
+      "name": "早餐被当作工作餐免费",
+      "feature": {
+        "meal": "早餐",
+        "a_reason_work_meal": true,
+        "b_deduct": false
+      },
+      "correct": "应自付",
+      "basis": "规则 5.4：早餐仅「白班提前到岗（开始≤07:30）」「晚班跨天收工次日（≥05:30）」两种情况由公司承担；上班后刷卡吃早餐不因落在班次内而免费",
+      "action": "早餐不得进入工作餐判定分支"
+    },
+    {
+      "code": "D3",
+      "type": "计算错误",
+      "name": "下班时刻之后刷卡被算作班次内工作餐",
+      "feature": {
+        "meal": ["午餐", "晚餐"],
+        "swipe_after_shift_end": true,
+        "a_reason_work_meal": true,
+        "b_deduct": false,
+        "ot_covers_meal": false
+      },
+      "correct": "应自付",
+      "basis": "规则第三章：班次边界左闭右开，刷卡须 ≥ 上班时刻且 < 下班时刻；17:15 下班后 17:15:03 刷卡已不在工作时段内",
+      "action": "班次边界判定改为严格小于，且用含秒的刷卡时间"
+    },
+    {
+      "code": "D4",
+      "type": "计算错误",
+      "name": "加班覆盖两餐但当天只吃一餐，额度按晚餐优先作废",
+      "feature": {
+        "is_weekend": true,
+        "ot_mins_180_300": true,
+        "only_meal_of_day": true,
+        "a_deduct": false,
+        "b_deduct": true
+      },
+      "correct": "应抵",
+      "basis": "规则 5.5 第 6 条：只在「加班覆盖 + 当天实际刷卡」的餐别中抵扣；只吃了一餐的抵该餐，不得按晚餐优先把额度作废",
+      "action": "周末抵扣前先取当天实际刷卡餐别集合"
+    },
+    {
+      "code": "D5",
+      "type": "计算错误",
+      "name": "一天抵扣餐次超过加班时长对应额度",
+      "feature": {
+        "is_weekend": true,
+        "ot_mins_180_300": true,
+        "a_deducted_two_or_more": true
+      },
+      "correct": "应自付",
+      "basis": "规则 5.2：周末 3-5 小时（含 5 小时整）只抵 1 餐，超过额度的第二餐应自付",
+      "action": "核对当天抵扣笔数是否超过 n_meal"
+    },
+    {
+      "code": "D6",
+      "type": "计算错误",
+      "name": "同日同餐多笔重复抵扣",
+      "feature": {
+        "same_meal_dup": true,
+        "is_second_or_later": true,
+        "a_deduct": true,
+        "b_deduct": false
+      },
+      "correct": "应自付",
+      "basis": "规则 6.3 / 示例19：一天同餐只抵一笔，同组第一笔参与判定，第 2 笔及以后全额自付",
+      "action": "按刷卡时间排序取第一笔参与抵扣"
+    },
+    {
+      "code": "D7",
+      "type": "计算错误",
+      "name": "工作日加班未覆盖晚餐时段却抵了晚餐",
+      "feature": {
+        "meal": "晚餐",
+        "is_weekend": false,
+        "ot_mins_ge_60": true,
+        "ot_covers_meal": false,
+        "a_deduct": true,
+        "b_deduct": false
+      },
+      "correct": "应自付",
+      "basis": "规则示例20：加班时段须与晚餐时段（15:30-20:30）真实重叠才可抵，11:00-13:00 这类加班不抵晚餐",
+      "action": "工作日晚餐增加覆盖校验"
+    }
+  ]
+}

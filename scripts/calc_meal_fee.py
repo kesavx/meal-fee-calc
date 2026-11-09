@@ -91,6 +91,7 @@ def main():
     ap.add_argument('--ot', required=True, help='加班记录 xlsx')
     ap.add_argument('--meal', required=True, help='食堂打卡 xlsx')
     ap.add_argument('--shift', default=None, help='班次表 xlsx（可选）')
+    ap.add_argument('--roster', default=None, help='人员名单 xlsx（可选，只核算名单内人员）')
     ap.add_argument('--region', required=True, help='区域名，需在 regions.csv 中存在')
     ap.add_argument('--out', required=True, help='输出目录')
     ap.add_argument('--adjust-workdays', default='2026-09-20',
@@ -141,6 +142,25 @@ def main():
     if '单据类型' in ot.columns:
         ot = ot[ot['单据类型'].astype(str).str.strip() != '撤销'].copy()
     ot['加班日期'] = pd.to_datetime(ot['加班日期'])
+    # 加班时段解析 + 归属日期（规则 5.6：归属日期 = 实际打卡结束时间所在日期）
+    ot['_st'] = pd.to_datetime(ot.get('实际打卡加班时间'), errors='coerce')
+    ot['_en'] = pd.to_datetime(ot.get('实际打卡结束时间'), errors='coerce')
+    ot['_mins'] = ot.get('实际加班时长').apply(parse_minutes)
+    # 归属日：优先用结束时间日期，缺失回退加班日期
+    ot['_attr_date'] = ot.apply(
+        lambda r: (r['_en'].date() if pd.notna(r['_en']) else r['加班日期'].date()), axis=1)
+
+    # 按 (工号, 归属日) 预聚合所有加班段（同日多条=分段加班，时长累加）
+    OT_MAP = {}
+    for _, r in ot.iterrows():
+        if pd.isna(r['加班日期']):
+            continue
+        key = (str(r['员工工号']).strip(), r['_attr_date'])
+        seg = (r['_st'], r['_en']) if (pd.notna(r['_st']) and pd.notna(r['_en'])) else None
+        e = OT_MAP.setdefault(key, {'segs': [], 'mins': 0})
+        e['mins'] += int(r['_mins']) if pd.notna(r['_mins']) else 0
+        if seg:
+            e['segs'].append(seg)
 
     # 食堂打卡列名归一（避免"开餐餐次"/"餐次"等近似列冲突）
     meal_cols = {str(c).strip(): c for c in meal.columns}
@@ -173,8 +193,45 @@ def main():
     meal['开餐餐次'] = meal['开餐餐次'].astype(str).str.strip()
     meal['打卡总金额'] = pd.to_numeric(meal['打卡总金额'], errors='coerce').fillna(0)
 
-    # 去重：同工号+日期+餐别只留一笔
-    meal = meal.drop_duplicates(subset=['工号', '打卡日期', '开餐餐次'], keep='first').copy()
+    # ---- 人员名单过滤（可选）：只核算名单内人员 ----
+    if args.roster and os.path.exists(args.roster):
+        def norm_id(x):
+            if pd.isna(x):
+                return None
+            s = str(x).strip()
+            if s.endswith('.0'):
+                s = s[:-2]
+            if s.isdigit():
+                return str(int(s))
+            return s.upper()
+
+        xl = pd.ExcelFile(args.roster)
+        sh = '合计' if '合计' in xl.sheet_names else xl.sheet_names[0]
+        rdf = pd.read_excel(args.roster, sheet_name=sh, dtype=str)
+        id_col = None
+        for c in rdf.columns:
+            if '工号' in str(c):
+                id_col = c
+                break
+        if id_col is None:
+            sys.exit(f'名单 {args.roster} 未找到「工号」列，实际列：{list(rdf.columns)}')
+        rdf = rdf.dropna(subset=[id_col]).copy()
+        rdf['_id'] = rdf[id_col].map(norm_id)
+        roster_ids = set(rdf['_id'].dropna())
+        meal['_id'] = meal['工号'].map(norm_id)
+        n_before, p_before = len(meal), meal['工号'].nunique()
+        meal = meal[meal['_id'].isin(roster_ids)].copy()
+        print(f'名单过滤：名单 {len(roster_ids)} 人，匹配到就餐记录 {len(meal)} 笔 / '
+              f'{meal["工号"].nunique()} 人（过滤前 {n_before} 笔 / {p_before} 人）')
+        # 记录名单匹配结果供核对
+        matched_ids = set(meal['_id'].unique())
+        rdf['_匹配状态'] = rdf['_id'].apply(lambda x: '有就餐记录' if x in matched_ids else '无就餐记录')
+        roster_check = rdf.drop(columns=['_id'])
+        roster_check.to_csv(os.path.join(args.out, '_名单匹配核对.csv'), index=False, encoding='utf-8-sig')
+
+    # 一天同餐只抵一笔（规则 6.3 / 示例19）：同组内按刷卡时间第一笔参与判定，其余笔一律自付
+    meal = meal.sort_values(['工号', '打卡日期', '开餐餐次', '打卡时间']).reset_index(drop=True)
+    meal['_first_of_group'] = ~meal.duplicated(subset=['工号', '打卡日期', '开餐餐次'], keep='first')
 
     # ---- 班次表（可选）----
     shift_map = {}  # 工号 -> (start_hm, end_hm) 分钟
@@ -220,7 +277,50 @@ def main():
     def is_weekend(d):
         return d.weekday() >= 5 and d.date() not in adjust_days
 
+    # ---- 加班覆盖餐别判定（真实时段重叠，含边界）----
+    def covered_meals(segs, day):
+        """返回该日加班时段覆盖的餐别集合"""
+        res = set()
+        if not segs:
+            return res
+        from datetime import timedelta
+        for meal, (s_min, e_min) in SLOTS.items():
+            ws = datetime.combine(day.date(), time(0, 0)) + timedelta(minutes=s_min)
+            we = datetime.combine(day.date(), time(0, 0)) + timedelta(minutes=e_min)
+            for st, en in segs:
+                if st <= we and en >= ws:
+                    res.add(meal)
+                    break
+        return res
+
+    def early_arrival(segs, day):
+        """白班提前到岗：任一加班段开始 ≤ 提前线，且发生在当天上午（<09:00）"""
+        cutoff = hm_to_min(cfg['early_cutoff'])
+        if cutoff is None:
+            return False
+        for st, en in segs:
+            if st is None:
+                continue
+            if st.date() == day.date() and (st.hour * 60 + st.minute) <= cutoff:
+                return True
+        return False
+
+    def late_shift_morning(segs, day):
+        """晚班跨天收工次日 05:30-09:00"""
+        for st, en in segs:
+            if en is None:
+                continue
+            if en.date() == day.date() and en.hour * 60 + en.minute >= 5 * 60 + 30 \
+                    and en.hour * 60 + en.minute <= 9 * 60 and st is not None and st.date() < en.date():
+                return True
+        return False
+
     # ---- 逐笔核算 ----
+    # 预计算每人每天实际刷卡的餐别集合（周末抵扣须"实际就餐+加班覆盖"同时成立）
+    day_meals_map = {}
+    for (g, dt), grp in meal.groupby(['工号', '打卡日期']):
+        day_meals_map[(g, dt)] = set(grp['开餐餐次'].astype(str).str.strip())
+
     detail_rows = []
     for _, row in meal.iterrows():
         gh = row['工号']
@@ -231,96 +331,110 @@ def main():
         t_str = row['打卡时间']
         t_min = hm_to_min(t_str)
 
-        # 当日加班
-        day_ot = ot[(ot['员工工号'] == gh) & (ot['加班日期'] == d)]
-        mins = parse_minutes(day_ot['实际加班时长'].iloc[0]) if len(day_ot) > 0 else 0
+        # 当日加班（按归属日期聚合，同日分段累加）
+        otinfo = OT_MAP.get((gh, d.date()), {'segs': [], 'mins': 0})
+        mins = otinfo['mins']
+        segs = otinfo['segs']
+        covered = covered_meals(segs, d)
 
         weekend = is_weekend(d)
 
+        # 工作日午餐 4 小时门槛：班次时长 <4h 不豁免
+        shift_len = 0
+        for (ss, se) in get_shift(gh):
+            if se > ss:
+                shift_len = max(shift_len, se - ss)
+
         # 判断工作餐：仅工作日；刷卡时间落在班次时段内 → 免费
+        # ① 早餐不适用工作餐（规则 5.4 优先：早餐仅提前到岗/跨天收工两种情况可抵）
+        # ② 班次结束时刻取严格小于：17:15 下班后刷卡（如 17:15:03）不算工作餐
+        # ③ 工作日午餐须班次≥4h 才免费（规则第四章备注①）
         is_work_meal = False
-        if not weekend and t_min is not None:
+        if not weekend and t_min is not None and meal_type != '早餐':
             for (ss, se) in get_shift(gh):
-                if ss <= t_min <= se:
+                if ss <= t_min < se:
                     is_work_meal = True
                     break
+        if is_work_meal and meal_type == '午餐' and not weekend and shift_len < 4 * 60:
+            is_work_meal = False
 
         deduct = 0.0
         reason = ''
 
-        if is_work_meal:
+        if not row['_first_of_group']:
+            # 同日同餐第 2 笔及以后：不再抵扣，全额自付（规则 6.3 / 示例19）
+            reason = '同日同餐别第2笔及以后（一天同餐只抵一笔），全额自付'
+        elif is_work_meal:
             deduct = amt
             reason = '工作餐（班次时段内），免费'
         elif meal_type == '早餐':
-            # 早餐特殊规则（规则基准 5.4）
-            if not day_ot.empty:
-                start_str = str(day_ot['实际打卡加班时间'].iloc[0])
-                end_str = str(day_ot['实际打卡结束时间'].iloc[0])
-                start_dt, end_dt = None, None
-                for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
-                    for s, attr in ((start_str, 'start_dt'), (end_str, 'end_dt')):
-                        try:
-                            parsed = datetime.strptime(s.strip(), fmt)
-                            if attr == 'start_dt':
-                                start_dt = parsed
-                            else:
-                                end_dt = parsed
-                        except ValueError:
-                            continue
-                start_min = start_dt.hour * 60 + start_dt.minute if start_dt else hm_to_min(start_str)
-                end_min = end_dt.hour * 60 + end_dt.minute if end_dt else hm_to_min(end_str)
-                crosses_day = bool(start_dt and end_dt and end_dt.date() > start_dt.date())
-                # ① 白班提前到岗：开始时间在凌晨/上午（<09:00）且 ≤ 提前线
-                cutoff = hm_to_min(cfg['early_cutoff'])
-                if start_min is not None and start_min < 9 * 60 and cutoff is not None and start_min <= cutoff:
-                    deduct = min(amt, cfg['breakfast_amt'])
-                    reason = f'白班提前到岗（开始≤{cfg["early_cutoff"]}），抵早餐'
-                # ② 晚班后次日早上：跨天且收工落在早餐时段（05:30-09:00）
-                elif crosses_day and end_min is not None and 5 * 60 + 30 <= end_min <= 9 * 60:
-                    deduct = min(amt, cfg['breakfast_amt'])
-                    reason = f'晚班跨天收工次日{end_dt.strftime("%H:%M")}，抵早餐'
-                else:
-                    reason = f'早餐不达标（开始{start_str}，结束{end_str}），自付'
-            else:
+            # 早餐特殊规则（规则 5.4）：仅①白班提前到岗 ②晚班跨天收工次日
+            if early_arrival(segs, d):
+                deduct = min(amt, cfg['breakfast_amt'])
+                reason = f'白班提前到岗（开始≤{cfg["early_cutoff"]}），抵早餐'
+            elif late_shift_morning(segs, d):
+                deduct = min(amt, cfg['breakfast_amt'])
+                reason = '晚班跨天收工次日（≥05:30），抵早餐'
+            elif not segs:
                 reason = '早餐：无加班记录，不抵'
+            else:
+                reason = f'早餐不达标（加班{mins}min，开始{segs[0][0].strftime("%m-%d %H:%M") if segs[0][0] else "-"}），自付'
         elif not weekend:
             # 工作日
             if meal_type == '午餐':
-                # 4小时门槛：班次时长≥4h免费，否则扣5元
-                shift_len = 0
-                for (ss, se) in get_shift(gh):
-                    if se > ss:
-                        shift_len = max(shift_len, se - ss)
                 if shift_len >= 4 * 60:
                     deduct = amt
                     reason = '工作日午餐（班次≥4h），免费'
                 else:
                     deduct = 0
-                    reason = f'工作日午餐但班次时长{shift_len}min<4h，不豁免扣5元'
+                    reason = f'工作日午餐但班次{shift_len}min<4h，不豁免扣5元'
             elif meal_type == '晚餐':
-                if mins >= 60:
+                # 须加班≥1h 且 加班时段覆盖晚餐时段（规则 5.3 / 示例20）
+                if mins >= 60 and '晚餐' in covered:
                     deduct = min(amt, cfg['dinner_amt'])
-                    reason = f'工作日加班{mins}min≥1h，抵晚餐'
+                    reason = f'工作日加班{mins}min≥1h，覆盖晚餐，抵5元'
+                elif mins >= 60:
+                    reason = f'工作日加班{mins}min≥1h但未覆盖晚餐时段，不抵'
                 else:
                     reason = f'工作日加班{mins}min<1h，晚餐不抵'
             else:
                 reason = '工作日非午餐/晚餐餐别，自付'
         else:
-            # 周末/节假日
+            # 周末/节假日：先按时长定可抵餐次数，再按 晚餐>午餐>早餐 从「实际覆盖的餐别」中抵（未覆盖作废）
             if mins > 300:
-                if meal_type in ('午餐', '晚餐'):
-                    deduct = min(amt, cfg['dinner_amt'])
-                    reason = f'周末加班{mins}min>5h，抵{meal_type}'
-                else:
-                    reason = '周末加班>5h，早餐不抵'
+                n_meal = 2
             elif mins >= 180:
-                if meal_type == '晚餐':
-                    deduct = min(amt, cfg['dinner_amt'])
-                    reason = f'周末加班{mins}min(3-5h)，抵晚餐'
-                else:
-                    reason = f'周末加班{mins}min(3-5h)，优先抵晚餐，{meal_type}不抵'
+                n_meal = 1
             else:
-                reason = f'周末加班{mins}min<3h或无加班，{meal_type}自付'
+                n_meal = 0
+            # 周末早餐不参与（仅提前到岗/跨天可抵，本分支不处理早餐）
+            # 只在「加班覆盖 + 当天实际刷卡」的餐别中抵扣：避免只吃了午餐却把额度作废给晚餐
+            dm = day_meals_map.get((gh, d), set())
+            avail = [m for m in ('晚餐', '午餐') if m in covered and m in dm]
+            target = None
+            for m in avail:
+                if m == meal_type:
+                    target = m
+                    break
+            if n_meal > 0 and meal_type in avail:
+                # 该餐是优先序列中的第几顺位，是否在可抵名额内
+                rank = avail.index(meal_type) + 1
+                if rank <= n_meal:
+                    deduct = min(amt, cfg['dinner_amt'])
+                    reason = f'周末加班{mins}min，可抵{n_meal}餐，覆盖{meal_type}，抵5元'
+                else:
+                    reason = f'周末加班{mins}min可抵{n_meal}餐，按晚餐优先，{meal_type}不抵'
+            elif meal_type == '早餐':
+                if early_arrival(segs, d):
+                    deduct = min(amt, cfg['breakfast_amt'])
+                    reason = '周末白班提前到岗，抵早餐'
+                elif late_shift_morning(segs, d):
+                    deduct = min(amt, cfg['breakfast_amt'])
+                    reason = '周末晚班跨天收工次日，抵早餐'
+                else:
+                    reason = f'周末加班{mins}min，早餐不抵'
+            else:
+                reason = f'周末加班{mins}min<3h或无加班/未覆盖{meal_type}，{meal_type}自付'
 
         self_pay = round(max(0, amt - deduct), 2)
         detail_rows.append({
